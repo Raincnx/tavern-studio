@@ -1,0 +1,33 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { fixture, mockComfy } from './helpers.ts';
+import type { ImageJob } from '@tavern/contracts';
+
+test('offline jobs can explicitly stop tracking and retry frozen inputs once online', async t => {
+ const studio = await fixture(t);
+ const comfy = await mockComfy(t);
+ studio.store.saveSettings({...studio.store.settings(), researchUseConfirmed:true, comfyUrl:comfy.url});
+ const created = await studio.call('/image-jobs','POST',{prompt:'书店中的蓝色雨衣',seed:17});
+ assert.equal(created.statusCode,202);
+ const job=created.json<ImageJob>();
+ studio.store.updateJob(job.id,{status:'reconciling',promptId:'missing',needsAttention:true});
+ studio.comfy.history=async()=>{throw new TypeError('offline');};
+ assert.equal((await studio.call(`/image-jobs/${job.id}/resolve`,'POST',{confirmOutcomeUnknown:true})).statusCode,503);
+ assert.equal((await studio.call(`/image-jobs/${job.id}/resolve`,'POST',{confirmOutcomeUnknown:true,allowOffline:true})).statusCode,200);
+ await studio.worker.inspect({...job,promptId:'missing'});
+ assert.equal(studio.store.get<ImageJob>('image_jobs',job.id)?.status,'failed');
+ studio.comfy.health=async()=>false;
+ assert.equal((await studio.call(`/image-jobs/${job.id}/retry`,'POST',{})).statusCode,503);
+ studio.comfy.health=async()=>true;
+ const key=crypto.randomUUID();
+ const response=await studio.call(`/image-jobs/${job.id}/retry`,'POST',{},key);
+ assert.equal(response.statusCode,202);
+ const next=response.json<ImageJob>();
+ assert.equal(next.seed,17);
+ assert.equal(next.compiledPrompt,job.compiledPrompt);
+ assert.equal(next.promptId,undefined);
+ assert.notEqual(next.id,job.id);
+ assert.equal((await studio.call(`/image-jobs/${job.id}/retry`,'POST',{},key)).json().id,next.id);
+ const row=studio.store.db.prepare('SELECT graph FROM job_workflows WHERE job_id=?').get(next.id) as {graph:string};
+ assert.equal(JSON.parse(row.graph)['461'].inputs.filename_prefix,`TavernStudio/${next.id}/image`);
+});

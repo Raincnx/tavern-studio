@@ -1,0 +1,16 @@
+{
+  "name": "tavern-studio",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24.0.0" },
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "start": "node apps/server/src/index.ts",
+    "build": "npm run typecheck && npm run build --workspace @tavern/web",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "node --test apps/server/tests/*.test.ts"
+  },
+  "devDependencies": { "@types/node": "^24.0.0", "typescript": "~5.9.3" }
+}
