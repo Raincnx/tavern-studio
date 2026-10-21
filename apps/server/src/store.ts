@@ -1,10 +1,11 @@
+import { emptyWorldState } from './world-state.ts';
 import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import type { Asset, Bootstrap, Character, Chat, ImageJob, Message, Settings, StudioEvent, TextModelProfile } from '@tavern/contracts';
+import type { Asset, Bootstrap, Character, Chat, ImageJob, Message, Settings, StudioEvent, TextModelProfile, WorldState, WorldStateEvent, WorldStateSnapshot } from '@tavern/contracts';
 
-type Table = 'characters' | 'chats' | 'messages' | 'image_jobs' | 'assets';
+type Table = 'characters' | 'chats' | 'messages' | 'image_jobs' | 'assets' | 'personas';
 
 export class Store {
   db: DatabaseSync;
@@ -21,13 +22,20 @@ export class Store {
     if (version.user_version > 1) throw new Error('数据库版本较新，请勿使用旧版本启动');
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS characters (id TEXT PRIMARY KEY, body TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS personas (id TEXT PRIMARY KEY, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS chats (id TEXT PRIMARY KEY, character_id TEXT NOT NULL REFERENCES characters(id), body TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS chat_revisions (id TEXT PRIMARY KEY, chat_id TEXT NOT NULL REFERENCES chats(id), body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, chat_id TEXT NOT NULL REFERENCES chats(id), body TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS messages_chat ON messages(chat_id);
       CREATE TABLE IF NOT EXISTS image_jobs (id TEXT PRIMARY KEY, character_id TEXT REFERENCES characters(id), chat_id TEXT REFERENCES chats(id), status TEXT NOT NULL, body TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS jobs_status ON image_jobs(status);
       CREATE TABLE IF NOT EXISTS job_workflows (job_id TEXT PRIMARY KEY REFERENCES image_jobs(id), graph TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS scene_states (chat_id TEXT NOT NULL REFERENCES chats(id), source_id TEXT NOT NULL, history_hash TEXT NOT NULL, context_key TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY(chat_id, source_id));
+      CREATE TABLE IF NOT EXISTS world_checkpoints (chat_id TEXT NOT NULL REFERENCES chats(id), message_id TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY(chat_id,message_id));
+      CREATE TABLE IF NOT EXISTS world_states (chat_id TEXT PRIMARY KEY REFERENCES chats(id), revision INTEGER NOT NULL, body TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS world_state_events (id TEXT PRIMARY KEY, chat_id TEXT NOT NULL REFERENCES chats(id), revision INTEGER NOT NULL, body TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS world_events_chat ON world_state_events(chat_id, revision);
+      CREATE TABLE IF NOT EXISTS world_state_snapshots (id TEXT PRIMARY KEY, chat_id TEXT NOT NULL REFERENCES chats(id), revision INTEGER NOT NULL, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS assets (id TEXT PRIMARY KEY, job_id TEXT UNIQUE REFERENCES image_jobs(id), body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS idempotency (key TEXT PRIMARY KEY, hash TEXT NOT NULL, body TEXT NOT NULL);
@@ -45,6 +53,7 @@ export class Store {
       });
     }
     if (seed && this.list<Character>('characters').length === 0) this.seed();
+    for (const row of this.db.prepare('SELECT body FROM world_states').all() as {body:string}[]) { const state = JSON.parse(row.body) as WorldState; if(state.syncStatus === 'updating') this.saveWorldState({...state,syncStatus:'failed',syncError:'整理被服务重启中断，请重试。'}); }
     for (const message of this.list<Message>('messages').filter(item => item.status === 'streaming')) {
       const recovered: Message = { ...message, status: 'interrupted', error: '服务已重启，已保留生成内容，请重新发送或继续对话。' };
       this.saveMessage(recovered);
@@ -101,9 +110,65 @@ export class Store {
     this.db.prepare('INSERT INTO assets(id,job_id,body) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body').run(asset.id, asset.jobId ?? null, JSON.stringify(asset));
   }
 
+  archiveAndRewindChat(chat: Chat, retained: Message[]): void {
+    const checkpoints = this.worldCheckpoints(chat.id);
+    const scenes = this.db.prepare('SELECT * FROM scene_states WHERE chat_id=?').all(chat.id);
+    const snapshots = this.db.prepare('SELECT * FROM world_state_snapshots WHERE chat_id=?').all(chat.id);
+    this.db.prepare('INSERT INTO chat_revisions(id,chat_id,body) VALUES(?,?,?)').run(randomUUID(), chat.id, JSON.stringify({ checkpoints, chat, messages: this.messages(chat.id), scenes, world: this.worldState(chat.id), events: this.worldEvents(chat.id), snapshots, archivedAt: new Date().toISOString() }));
+    this.db.prepare('DELETE FROM messages WHERE chat_id=?').run(chat.id);
+    for (const message of retained) this.saveMessage(message);
+    for (const table of ['scene_states', 'world_state_events', 'world_state_snapshots']) this.db.prepare(`DELETE FROM ${table} WHERE chat_id=?`).run(chat.id);
+    this.restoreWorld(chat.id, retained);
+  }
+
+  deleteChat(id: string): void {
+    this.transaction(() => {
+      const jobs = this.db.prepare('SELECT id FROM image_jobs WHERE chat_id = ?').all(id) as { id: string }[];
+      for (const job of jobs) {
+        const assets = this.db.prepare('SELECT body FROM assets WHERE job_id = ?').all(job.id) as { body: string }[];
+        for (const row of assets) { try { unlinkSync(join(this.directory, 'media', `${(JSON.parse(row.body) as Asset).id}.png`)); } catch { } }
+        this.db.prepare('DELETE FROM assets WHERE job_id = ?').run(job.id);
+        this.db.prepare('DELETE FROM job_workflows WHERE job_id = ?').run(job.id);
+      }
+      this.db.prepare('DELETE FROM image_jobs WHERE chat_id = ?').run(id);
+      this.db.prepare('DELETE FROM scene_states WHERE chat_id = ?').run(id);
+      this.db.prepare('DELETE FROM world_state_events WHERE chat_id = ?').run(id);
+      this.db.prepare('DELETE FROM world_state_snapshots WHERE chat_id = ?').run(id);
+      this.db.prepare('DELETE FROM world_states WHERE chat_id = ?').run(id);
+      this.db.prepare('DELETE FROM world_checkpoints WHERE chat_id = ?').run(id);
+      this.db.prepare('DELETE FROM messages WHERE chat_id = ?').run(id);
+      this.db.prepare('DELETE FROM chat_revisions WHERE chat_id = ?').run(id);
+      this.db.prepare('DELETE FROM chats WHERE id = ?').run(id);
+      this.publish('chat.deleted', id, { id });
+    });
+  }
+
+  worldCheckpoints(chatId: string): { messageId: string; state: WorldState }[] {
+    return (this.db.prepare('SELECT message_id,body FROM world_checkpoints WHERE chat_id=? ORDER BY rowid').all(chatId) as {message_id:string;body:string}[]).map(r => ({messageId:r.message_id,state:JSON.parse(r.body)}));
+  }
+  checkpointWorld(chatId: string, messageId: string, state: WorldState): void {
+    this.db.prepare('INSERT INTO world_checkpoints(chat_id,message_id,body) VALUES(?,?,?) ON CONFLICT(chat_id,message_id) DO UPDATE SET body=excluded.body').run(chatId,messageId,JSON.stringify(state));
+  }
+  worldAt(chatId: string, messages: Message[]): WorldState {
+    const checkpoints = new Map(this.worldCheckpoints(chatId).map(c => [c.messageId,c.state]));
+    for (const message of [...messages].reverse()) { const state = checkpoints.get(message.id); if (state) return structuredClone(state); }
+    return { ...emptyWorldState(chatId), coverage: '该节点没有已整理的状态，请整理当前剧情。' };
+  }
+  restoreWorld(chatId: string, messages: Message[]): WorldState {
+    const previous = this.worldState(chatId);
+    const restored = { ...this.worldAt(chatId,messages), chatId, revision:(previous?.revision ?? 0)+1, syncStatus:'idle' as const, syncError:undefined, updatedAt:new Date().toISOString() };
+    const ids = new Set(messages.map(m=>m.id));
+    for(const checkpoint of this.worldCheckpoints(chatId)) if(!ids.has(checkpoint.messageId)) this.db.prepare('DELETE FROM world_checkpoints WHERE chat_id=? AND message_id=?').run(chatId,checkpoint.messageId);
+    this.saveWorldState(restored); return restored;
+  }
+  worldState(chatId: string): WorldState | undefined { const row = this.db.prepare('SELECT body FROM world_states WHERE chat_id=?').get(chatId) as { body: string } | undefined; return row ? JSON.parse(row.body) as WorldState : undefined; }
+  saveWorldState(state: WorldState): void { this.db.prepare('INSERT INTO world_states(chat_id,revision,body) VALUES(?,?,?) ON CONFLICT(chat_id) DO UPDATE SET revision=excluded.revision,body=excluded.body').run(state.chatId, state.revision, JSON.stringify(state)); }
+  saveWorldEvent(event: WorldStateEvent): void { this.db.prepare('INSERT INTO world_state_events(id,chat_id,revision,body) VALUES(?,?,?,?)').run(event.id, event.chatId, event.revision, JSON.stringify(event)); }
+  worldEvents(chatId: string): WorldStateEvent[] { return (this.db.prepare('SELECT body FROM world_state_events WHERE chat_id=? ORDER BY revision').all(chatId) as { body: string }[]).map(row => JSON.parse(row.body) as WorldStateEvent); }
+  saveWorldSnapshot(snapshot: WorldStateSnapshot): void { this.db.prepare('INSERT INTO world_state_snapshots(id,chat_id,revision,body) VALUES(?,?,?,?)').run(randomUUID(), snapshot.chatId, snapshot.revision, JSON.stringify(snapshot)); }
   settings(): Settings {
     const row = this.db.prepare('SELECT body FROM settings WHERE key = ?').get('main') as { body: string };
-    return { textReasoningEffort: 'default', ...JSON.parse(row.body), hasApiKey: false, textProfiles: this.textProfiles() } as Settings;
+    return { textPresetJson: '', textReasoningEffort: 'default', textPresetName: '', textSystemPrompt: '', ...JSON.parse(row.body), hasApiKey: false, textProfiles: this.textProfiles() } as Settings;
   }
 
   textProfiles(): TextModelProfile[] {
@@ -127,8 +192,8 @@ export class Store {
     const { textProfiles: _profiles, ...main } = settings;
     this.db.prepare('INSERT INTO settings(key,body) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET body=excluded.body').run('main', JSON.stringify({ ...main, hasApiKey: false }));
     if (settings.activeTextProfileId) {
-      const { textUrl, textModel, allowCloud, temperature, maxTokens, contextWindow, textReasoningEffort = 'default' } = settings;
-      const profile = { id: settings.activeTextProfileId, name: settings.textProfileName || textModel || '文本模型', textUrl, textModel, allowCloud, temperature, maxTokens, contextWindow, textReasoningEffort };
+      const { textProtocol = 'openai', textUrl, textModel, allowCloud, temperature, maxTokens, contextWindow, textReasoningEffort = 'default', textPresetName = '', textSystemPrompt = '', textPresetJson = '' } = settings;
+      const profile = { textProtocol, id: settings.activeTextProfileId, name: settings.textProfileName || textModel || '文本模型', textUrl, textModel, allowCloud, temperature, maxTokens, contextWindow, textReasoningEffort, textPresetName, textSystemPrompt, textPresetJson };
       this.db.prepare('INSERT INTO settings(key,body) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET body=excluded.body').run(`textProfile:${profile.id}`, JSON.stringify(profile));
     }
   }

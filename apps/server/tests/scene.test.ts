@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import type { Character, Chat, Message, SceneState, SceneContext, ImageJob } from '@tavern/contracts';
 import { fixture, mockServer, mockComfy } from './helpers.ts';
 import { buildApp } from '../src/app.ts';
-import { sceneInput, sceneVisual, inheritScene } from '../src/scene.ts';
+import { sceneInput, sceneVisual, inheritScene, normalizeModelScene } from '../src/scene.ts';
 import { compileVisualPrompt } from '../src/visual.ts';
 
 function state(source?: string): SceneState {
@@ -163,4 +163,46 @@ test('image prompt renders confirmed state into visual prose without provenance 
   assert.match(prompt, /光照方向/);
   assert.match(prompt, /服装材质、褶皱/);
   assert.doesNotMatch(prompt, /evidence-message|explicit|旧服装|镜头与构图：未知|按当前画面状态生成/);
+});
+
+
+test('model provenance normalization accepts uncertain labels, retains manual state and rejects foreign sources', async t => {
+  const studio = await fixture(t);
+  const history = [{ id: 'old' }, { id: 'new' }] as Message[];
+  const previous = state('old');
+  previous.people[0].outfit = { value: '白衬衫', basis: 'manual', sourceMessageId: 'old' };
+  const raw: any = state('new');
+  raw.camera.basis = 'inferred';
+  raw.setting.basis = ' EXPLICIT ';
+  raw.people[0].outfit = { value: '红裙', basis: 'guessed', sourceMessageId: 'new' };
+  let result = inheritScene(sceneInput(normalizeModelScene(raw, undefined, previous), history), previous, history);
+  assert.equal(result.camera.basis, 'uncertain');
+  assert.equal(result.setting.basis, 'explicit');
+  assert.equal(result.people[0].outfit.value, '白衬衫');
+  raw.people[0].outfit = { value: '白衬衫', basis: 'manual', sourceMessageId: 'old' };
+  result = inheritScene(sceneInput(normalizeModelScene(raw, undefined, previous), history), previous, history);
+  assert.equal(result.people[0].outfit.basis, 'manual');
+  raw.people[0].outfit = { value: '红裙', basis: 'explicit', sourceMessageId: 'new' };
+  result = inheritScene(sceneInput(normalizeModelScene(raw, undefined, previous), history), previous, history);
+  assert.equal(result.people[0].outfit.value, '红裙');
+  raw.camera.sourceMessageId = 'other-chat';
+  assert.throws(() => sceneInput(normalizeModelScene(raw), history), /不属于/);
+  assert.throws(() => sceneInput(raw, history, true), /依据无效/);
+
+  const responseState: any = state();
+  responseState.camera.basis = 'inferred';
+  responseState.setting.basis = 'character_description';
+  responseState.people[0].action = '右手扶书';
+  delete responseState.people[0].props;
+  const url = await mockServer(t, (_request, response) => response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(responseState) } }] })));
+  studio.store.saveSettings({ ...studio.store.settings(), textUrl: url, textModel: 'test', contextWindow: 32768 });
+  const character = studio.store.list<Character>('characters')[0];
+  const chat = (await studio.call('/chats', 'POST', { characterId: character.id })).json<Chat>();
+  const response = await studio.call('/image-prompts', 'POST', { chatId: chat.id, structured: true });
+  assert.equal(response.statusCode, 200, response.body);
+  assert.equal(response.json().scene.camera.basis, 'uncertain');
+  assert.equal(response.json().scene.setting.basis, 'uncertain');
+  assert.equal(response.json().scene.people[0].action.basis, 'uncertain');
+  assert.equal(response.json().scene.people[0].props.value, '');
+  assert.equal(studio.provider.draftCount, 0);
 });

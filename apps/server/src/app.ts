@@ -10,10 +10,14 @@ import { characterInput, integer, object, settingsInput, text } from './validati
 import { inspectPng, savePng } from './images.ts';
 import { ComfyAdapter, compileWorkflow } from './comfy.ts';
 import { JobWorker, terminal } from './jobs.ts';
-import { assemblePrompt, TextService } from './text.ts';
+import { assemblePrompt } from './text.ts';
+import { WorldTextService } from './world-text.ts';
 import { checkReference, compileVisualPrompt, defaultOutfit, visualContext, visualInput } from './visual.ts';
-import { sceneContext, sceneInput, sceneDescription, sceneVisual, saveScene, inheritScene } from './scene.ts';
-import type { Asset, Character, Chat, ImageJob, Message, StudioEvent } from '@tavern/contracts';
+import { sceneContext, sceneInput, sceneDescription, sceneVisual, saveScene, inheritScene, normalizeModelScene, applyParticipants } from './scene.ts';
+import { personaRoutes, defaultParticipants } from './persona.ts';
+import { correctionProposal } from './scene-correction.ts';
+import { applyWorldPatch, createWorldEvent, emptyWorldState, worldPath } from './world-state.ts';
+import type { Asset, Character, Chat, ImageJob, Message, StudioEvent, StatePatch } from '@tavern/contracts';
 
 interface AppOptions { dataDirectory?: string; workflowPath?: string; startWorker?: boolean; seed?: boolean; development?: boolean; port?: number; logger?: boolean }
 
@@ -26,7 +30,7 @@ export async function buildApp(options: AppOptions = {}) {
   comfy.clientId = clientRow ? JSON.parse(clientRow.body) as string : randomUUID();
   if (!clientRow) store.db.prepare('INSERT INTO settings(key,body) VALUES(?,?)').run('comfyClient', JSON.stringify(comfy.clientId));
   const worker = new JobWorker(store, comfy);
-  const provider = new TextService(store);
+  const provider = new WorldTextService(store);
   worker.canRun = () => provider.running.size === 0 && provider.draftCount === 0;
   const sessionToken = randomBytes(32).toString('hex');
   const csrfToken = randomBytes(32).toString('hex');
@@ -105,11 +109,31 @@ export async function buildApp(options: AppOptions = {}) {
   }
 
   app.get('/api/v1/scene-state', async request => sceneFor(object(request.query)).context);
+  app.post('/api/v1/scene-corrections', async (request, reply) => {
+    const body = object(request.body), current = sceneFor(body);
+    if (body.sceneContextKey !== current.context.key) throw new AppError(409, 'SCENE_CHANGED', '剧情已变化，请重新读取画面再修正');
+    if (provider.running.size || provider.draftCount) throw new AppError(409, 'CHAT_BUSY', '请等待文本生成完成');
+    if (store.list<ImageJob>('image_jobs').some(job => !terminal.has(job.status) && job.status !== 'queued')) throw new AppError(409, 'LOCAL_RESOURCE_BUSY', '请等待当前生图完成再修正');
+    const original = applyParticipants(sceneInput(body.scene, current.history, true), current.visual?.snapshot);
+    const intent = text(body.instruction, '画面修正', 1000, true);
+    request.raw.socket.setTimeout?.(135000);
+    const controller = new AbortController();
+    const disconnected = () => { if (!reply.raw.writableEnded) controller.abort(); };
+    reply.raw.on('close', disconnected);
+    try {
+      const raw = await provider.correctScene(intent, original, controller.signal);
+      let parsed: unknown;
+      try { parsed = JSON.parse(raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '')); }
+      catch { throw new AppError(502, 'CORRECTION_INVALID', '修正结果不是有效 JSON，未修改画面'); }
+      if (sceneFor(body).context.key !== current.context.key) throw new AppError(409, 'SCENE_CHANGED', '修正期间剧情已变化，请重新读取画面');
+      return { ...correctionProposal(parsed, original), sceneContextKey: current.context.key };
+    } finally { reply.raw.off('close', disconnected); }
+  });
   app.put('/api/v1/scene-state', async request => {
     const body = object(request.body);
     const current = sceneFor(body);
     if (body.sceneContextKey !== current.context.key) throw new AppError(409, 'SCENE_CHANGED', '剧情或角色已变化，请重新读取画面状态');
-    const state = sceneInput(body.scene, current.history, true);
+    const state = applyParticipants(sceneInput(body.scene, current.history, true), current.visual?.snapshot);
     if (current.chat) saveScene(store, current.chat.id, current.history, current.visual?.key ?? '', state);
     return { ...sceneFor(body).context, state, pendingMessages: 0, prompt: sceneDescription(state) };
   });
@@ -151,13 +175,14 @@ export async function buildApp(options: AppOptions = {}) {
     return updated;
   });
 
+  personaRoutes(app, store, () => provider.running.size > 0 || provider.draftCount > 0);
   app.get('/health', async () => ({ status: 'ok', application: 'tavern-studio', version: '0.1.0' }));
   app.get('/api/v1/session', async (_request, reply) => {
     reply.header('set-cookie', `tavern_session=${sessionToken}; Path=/; HttpOnly; SameSite=Strict`);
     return { csrfToken };
   });
   app.get('/api/v1/bootstrap', async () => { const bootstrap = store.bootstrap(); bootstrap.settings.hasApiKey = !!provider.apiKey; return bootstrap; });
-  app.get('/api/v1/system/status', async () => ({ comfy: { online: await comfy.health(), message: 'ComfyUI · 本机图像推理' }, text: { configured: !!store.settings().textUrl && !!store.settings().textModel, model: store.settings().textModel }, version: '0.1.0' }));
+  app.get('/api/v1/system/status', async () => ({ comfy: { online: await comfy.health(), message: 'ComfyUI · 本机图像推理' }, text: { busy: provider.running.size > 0 || provider.draftCount > 0, configured: !!store.settings().textUrl && !!store.settings().textModel, model: store.settings().textModel }, version: '0.1.0' }));
 
   app.post('/api/v1/characters', async request => {
     const id = randomUUID();
@@ -222,10 +247,10 @@ export async function buildApp(options: AppOptions = {}) {
     if (operation.existing) return operation.existing;
     const character = required<Character>('characters', text(body.characterId, '角色 ID', 80, true));
     const now = new Date().toISOString();
-    const chat: Chat = { id: randomUUID(), characterId: character.id, title: `${character.name}的故事`, revision: 1, outfits: [defaultOutfit(character)], createdAt: now, updatedAt: now };
+    const chat: Chat = { id: randomUUID(), characterId: character.id, title: `${character.name}的故事`, revision: 1, outfits: [defaultOutfit(character)], ...defaultParticipants(store), createdAt: now, updatedAt: now };
     store.transaction(() => {
       store.saveChat(chat);
-      if (character.firstMessage) store.saveMessage({ id: randomUUID(), chatId: chat.id, role: 'assistant', content: character.firstMessage.replaceAll('{{char}}', character.name).replaceAll('{{user}}', '旅人'), status: 'complete', createdAt: now });
+      if (character.firstMessage) store.saveMessage({ id: randomUUID(), chatId: chat.id, role: 'assistant', content: character.firstMessage.replaceAll('{{char}}', character.name).replaceAll('{{user}}', chat.userPersona?.name ?? '旅人'), status: 'complete', createdAt: now });
       remember(operation, chat);
     });
     store.publish('chat.updated', chat.id, chat);
@@ -233,6 +258,40 @@ export async function buildApp(options: AppOptions = {}) {
   });
 
   app.get<{ Params: { id: string } }>('/api/v1/chats/:id/messages', async request => { required<Chat>('chats', request.params.id); return store.messages(request.params.id).slice(-500); });
+  app.get<{ Params: { id: string } }>('/api/v1/chats/:id/world-state', async request => { const chat = required<Chat>('chats', request.params.id); const state = store.worldState(chat.id) ?? emptyWorldState(chat.id); store.saveWorldState(state); return state; });
+  app.get<{ Params: { id: string } }>('/api/v1/chats/:id/world-state/events', async request => { required<Chat>('chats', request.params.id); return store.worldEvents(request.params.id); });
+  app.post<{ Params: { id: string } }>('/api/v1/chats/:id/world-state/refresh', async (request, reply) => {
+    required<Chat>('chats',request.params.id);
+    if(store.list<ImageJob>('image_jobs').some(job=>!terminal.has(job.status))) throw new AppError(409,'JOB_ACTIVE','请等待生图任务结束后整理状态');
+    void provider.refreshWorld(request.params.id); reply.code(202); return { accepted:true };
+  });
+  app.post<{ Params: { id: string } }>('/api/v1/chats/:id/world-state/patch', async request => {
+    const chat = required<Chat>('chats', request.params.id);
+    if(provider.running.has(chat.id)||provider.draftCount) throw new AppError(409,'CHAT_BUSY','请等待当前生成或整理结束');
+    const body = object(request.body); const state = store.worldState(chat.id) ?? emptyWorldState(chat.id);
+    if (body.expectedRevision !== state.revision) throw new AppError(409, 'WORLD_STATE_CONFLICT', '世界状态已变化，请重新读取后再提交');
+    const patches=body.patch as StatePatch[];
+    const result=applyWorldPatch(state,patches);
+    const unlock=body.unlockPaths??[];
+    if(!Array.isArray(unlock)||unlock.length>100) throw new AppError(422,'WORLD_STATE_INVALID','解锁字段无效');
+    for(const path of unlock) worldPath(path);
+    result.state.lockedPaths=[...new Set([...(state.lockedPaths??[]).filter(p=>!unlock.includes(p)),...patches.map(p=>p.path)])];
+    if(result.state.lockedPaths.length>100) throw new AppError(422,'WORLD_STATE_INVALID','锁定字段过多');
+    result.state.revision=state.revision+1;
+    const last=store.messages(chat.id).filter(m=>m.status==='complete').at(-1);
+    const event=createWorldEvent(chat.id,result.state.revision,patches,result.inverse,'manual',last?.id);
+    store.transaction(()=>{store.saveWorldState(result.state);store.saveWorldEvent(event);if(last) store.checkpointWorld(chat.id,last.id,result.state);});
+    store.publish('world_state.updated',chat.id,result.state);
+    return { state:result.state,revision:result.state.revision,applied:true,eventId:event.id };
+  });
+  app.delete<{ Params: { id: string } }>('/api/v1/chats/:id', async request => {
+    const chat = required<Chat>('chats', request.params.id);
+    if (provider.running.has(chat.id) || provider.draftCount) throw new AppError(409, 'CHAT_BUSY', '请等待当前生成完成后再删除故事');
+    const active = store.list<ImageJob>('image_jobs').find(job => job.chatId === chat.id && !terminal.has(job.status));
+    if (active) throw new AppError(409, 'JOB_ACTIVE', '请先停止或完成这个故事里的生图任务');
+    store.deleteChat(chat.id);
+    return { id: chat.id };
+  });
 
   app.post<{ Params: { id: string } }>('/api/v1/chats/:id/generations', async (request, reply) => {
     const body = object(request.body);
@@ -248,7 +307,7 @@ export async function buildApp(options: AppOptions = {}) {
     const now = new Date().toISOString();
     const user: Message = { id: randomUUID(), chatId: chat.id, role: 'user', content: text(body.content, '消息', 12000, true), status: 'complete', createdAt: now };
     const history = [...store.messages(chat.id), user];
-    assemblePrompt(character, history, settings);
+    provider.prompt(chat.id, character, history, settings);
     const assistant: Message = { id: randomUUID(), chatId: chat.id, role: 'assistant', content: '', status: 'streaming', createdAt: now };
     const updated = { ...chat, revision: chat.revision + 1, updatedAt: now };
     const result = { chat: updated, user, assistant };
@@ -257,6 +316,72 @@ export async function buildApp(options: AppOptions = {}) {
     store.publish('message.updated', user.id, user);
     store.publish('message.updated', assistant.id, assistant);
     provider.start(chat.id, assistant.id, character, history);
+    reply.code(202);
+    return result;
+  });
+
+  app.post<{ Params: { id: string } }>('/api/v1/chats/:id/fork', async request => {
+    const body = object(request.body);
+    const operation = deduplicate(`fork:${request.params.id}`, request.headers['idempotency-key'], body);
+    if (operation.existing) return operation.existing;
+    const original = required<Chat>('chats', request.params.id);
+    if (provider.running.has(original.id) || provider.draftCount) throw new AppError(409, 'CHAT_BUSY', '请等待当前生成结束后创建分支');
+    if (body.expectedChatRevision !== original.revision) throw new AppError(409, 'REVISION_CONFLICT', '会话已更新，请刷新后重试');
+    const history = store.messages(original.id);
+    const index = history.findIndex(m => m.id === body.messageId);
+    if (index < 0 || history[index].status !== 'complete') throw new AppError(400, 'INVALID_MESSAGE', '请选择当前故事中已完成的消息');
+    const retained = history.slice(0, index + 1);
+    const now = new Date().toISOString(), id = randomUUID();
+    const copied = retained.map(m => ({ ...m, id: randomUUID(), chatId: id }));
+    const ids = new Map(retained.map((m, i) => [m.id, copied[i].id]));
+    const base = original.title.replace(/(?: · (?:重发)?分支(?: \d+)?)+$/, '').slice(0, 60);
+    let number = 1;
+    const titles = new Set(store.list<Chat>('chats').map(c => c.title));
+    while (titles.has(`${base} · 分支 ${number}`)) number++;
+    const chat: Chat = { ...original, id, title: `${base} · 分支 ${number}`, revision: 1, createdAt: now, updatedAt: now,
+      forkedFrom: { chatId: original.id, messageId: history[index].id, title: original.title },
+      outfits: original.outfits?.filter(o => o.fromMessageId && ids.has(o.fromMessageId)).map(o => ({ ...o, id: randomUUID(), fromMessageId: ids.get(o.fromMessageId!) })) };
+    const result = { chat };
+    store.transaction(() => { store.saveChat(chat); for (const m of copied) store.saveMessage(m);
+      const checkpoints=store.worldCheckpoints(original.id);
+      const remap=(value: unknown): any => typeof value === 'string' ? (ids.get(value)??value) : Array.isArray(value) ? value.map(remap) : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([k,v])=>[k,remap(v)])) : value;
+      for(const checkpoint of checkpoints) if(ids.has(checkpoint.messageId)) store.checkpointWorld(id,ids.get(checkpoint.messageId)!,{...remap(checkpoint.state),chatId:id});
+      const restored={...remap(store.worldAt(original.id,retained)),chatId:id,syncStatus:'idle' as const,syncError:undefined};
+      store.saveWorldState(restored); remember(operation, result); });
+    store.publish('chat.updated', id, chat);
+    return result;
+  });
+
+  app.post<{ Params: { id: string } }>('/api/v1/chats/:id/resend', async (request, reply) => {
+    const body = object(request.body);
+    const operation = deduplicate(`resend:${request.params.id}`, request.headers['idempotency-key'], body);
+    if (operation.existing) return operation.existing;
+    const original = required<Chat>('chats', request.params.id);
+    if (provider.running.size || provider.draftCount) throw new AppError(409, 'CHAT_BUSY', '请等待生成完成或先停止');
+    if (body.expectedChatRevision !== original.revision) throw new AppError(409, 'REVISION_CONFLICT', '会话已更新，请刷新后重试');
+    const history = store.messages(original.id);
+    const index = history.findIndex(m => m.id === body.messageId);
+    if (index < 0 || history[index].role !== 'user') throw new AppError(400, 'INVALID_MESSAGE', '请选择当前故事中的用户消息');
+    const content = text(body.content, '消息', 12000, true);
+    const settings = provider.configured();
+    if (store.list<ImageJob>('image_jobs').some(job => !terminal.has(job.status) && job.status !== 'queued') && ['localhost', '127.0.0.1', '[::1]'].includes(new URL(settings.textUrl).hostname)) throw new AppError(409, 'LOCAL_RESOURCE_BUSY', '本地生图执行中，请稍后重发');
+    if (store.list<ImageJob>('image_jobs').some(job => job.chatId === original.id && !terminal.has(job.status))) throw new AppError(409, 'JOB_ACTIVE', '请等待这个故事的生图任务结束后重发');
+    const now = new Date().toISOString(), id = original.id;
+    const retained = history.slice(0, index);
+    const ids = new Set(retained.map(m => m.id));
+    const chat: Chat = { ...original, revision: original.revision + 1, updatedAt: now,
+      outfits: original.outfits?.filter(o => o.fromMessageId && ids.has(o.fromMessageId)) };
+    const user: Message = { ...history[index], content, status: 'complete', error: undefined };
+    const assistant: Message = { id: randomUUID(), chatId: id, role: 'assistant', content: '', status: 'streaming', createdAt: now };
+    const character = required<Character>('characters', chat.characterId);
+    const rewind = store.worldAt(id,retained);
+    provider.prompt(id,character,[...retained,user],settings,rewind);
+    const result = { chat, user, assistant };
+    store.transaction(() => { store.archiveAndRewindChat(original, retained); store.saveChat(chat); store.saveMessage(user); store.saveMessage(assistant); remember(operation, result); });
+    store.publish('chat.updated', id, chat);
+    store.publish('world_state.updated',id,store.worldState(id));
+    store.publish('chat.history_reset', id, { chatId: id, messages: [...retained, user, assistant] });
+    provider.start(id, assistant.id, character, [...retained, user]);
     reply.code(202);
     return result;
   });
@@ -302,7 +427,7 @@ export async function buildApp(options: AppOptions = {}) {
         let parsed: unknown;
         try { parsed = JSON.parse(raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '')); }
         catch { throw new AppError(502, 'SCENE_INVALID', '模型返回的画面状态不是有效 JSON，未保存本次结果，请重试'); }
-        const state = inheritScene(sceneInput(parsed, prefix), previous.state, prefix);
+        const state = applyParticipants(inheritScene(sceneInput(normalizeModelScene(parsed, previous.state?.identity ?? batchVisual?.snapshot.identity, previous.state), prefix), previous.state, prefix), batchVisual?.snapshot);
         const confirmed = batchVisual?.snapshot.outfit;
         if (confirmed?.fromMessageId && batch.some(message => message.id === confirmed.fromMessageId)) {
           const main = state.people.find(person => person.id === 'main')!;
@@ -336,6 +461,12 @@ export async function buildApp(options: AppOptions = {}) {
     const scene = body.scene ? sceneInput(body.scene, sceneCurrent.history, true) : undefined;
     if (scene && !job.sourceMessageId) job.sourceMessageId = sceneCurrent.history.at(-1)?.id;
     job.visual = sceneVisual(context?.snapshot, scene);
+    const referenceSeeds = new Set((job.visual?.references ?? []).flatMap(reference => {
+      const asset = store.get<Asset>('assets', reference.assetId);
+      return asset?.jobId ? [asset.seed] : [];
+    }));
+    if (body.seed !== undefined && referenceSeeds.has(job.seed)) throw new AppError(409, 'REFERENCE_SEED_CONFLICT', '编辑 Seed 与参考图的生成 Seed 相同，可能导致过锐化或忽略编辑要求。请清空 Seed 使用随机值，或换一个数值。');
+    while (referenceSeeds.has(job.seed)) job.seed = (job.seed + 1) % 2 ** 32;
     job.compiledPrompt = compileVisualPrompt(job.prompt, job.visual);
     if (job.visual?.references.length) job.workflowId = 'qwen-image-2.1-reference-v1';
     store.transaction(() => { store.saveJob(job); store.db.prepare('INSERT INTO job_workflows(job_id,graph) VALUES(?,?)').run(job.id, JSON.stringify(compileWorkflow(comfy.template, job))); remember(operation, job); });
@@ -421,7 +552,7 @@ export async function buildApp(options: AppOptions = {}) {
     if (store.textProfiles().length >= 30) throw new AppError(400, 'MODEL_LIMIT', '最多保存 30 套模型配置');
     const body = object(request.body);
     const previous = store.settings();
-    const settings = settingsInput({ ...body, comfyUrl: previous.comfyUrl, researchUseConfirmed: previous.researchUseConfirmed }, previous);
+    const settings = settingsInput({ ...body, textProtocol: body.textProtocol ?? 'openai', textPresetJson: body.textPresetJson ?? '', textPresetName: body.textPresetName ?? '', textSystemPrompt: body.textSystemPrompt ?? '', comfyUrl: previous.comfyUrl, researchUseConfirmed: previous.researchUseConfirmed }, previous);
     settings.activeTextProfileId = randomUUID();
     settings.textProfileName = text(body.textProfileName, '配置名称', 80, true);
     if (!settings.textUrl || !settings.textModel) throw new AppError(400, 'TEXT_NOT_CONFIGURED', '请填写服务地址和模型名称');
@@ -437,7 +568,7 @@ export async function buildApp(options: AppOptions = {}) {
     const profile = store.textProfiles().find(item => item.id === request.params.id);
     if (!profile) throw new AppError(404, 'MODEL_NOT_FOUND', '模型配置不存在');
     const { id, name, hasApiKey: _hasKey, ...connection } = profile;
-    store.saveSettings({ ...store.settings(), ...connection, textReasoningEffort: connection.textReasoningEffort ?? 'default', activeTextProfileId: id, textProfileName: name });
+    store.saveSettings({ ...store.settings(), ...connection, textProtocol: connection.textProtocol ?? 'openai', textPresetJson: connection.textPresetJson ?? '', textPresetName: connection.textPresetName ?? '', textSystemPrompt: connection.textSystemPrompt ?? '', textReasoningEffort: connection.textReasoningEffort ?? 'default', activeTextProfileId: id, textProfileName: name });
     provider.apiKey = store.textApiKey(id) ?? '';
     const result = { ...store.settings(), hasApiKey: !!provider.apiKey };
     store.publish('settings.updated', 'main', result);

@@ -27,6 +27,17 @@ export interface VisualProfile {
   outfitAssetId?: string;
 }
 
+export interface UserPersona {
+  id: string;
+  name: string;
+  description: string;
+  visual: VisualProfile;
+  revision: number;
+  createdAt: string;
+  updatedAt: string;
+}
+export type FramingMode = 'auto' | 'together' | 'pov';
+
 export interface OutfitState {
   id: string;
   description: string;
@@ -36,11 +47,13 @@ export interface OutfitState {
 }
 
 export interface VisualSnapshot {
+  userPersona?: UserPersona;
+  framing?: FramingMode;
   characterId: string;
   characterRevision: number;
   identity: string;
   outfit: OutfitState;
-  references: { role: 'face' | 'body' | 'outfit'; assetId: string }[];
+  references: { role: 'face' | 'body' | 'outfit'; assetId: string; personId?: 'main' | 'user' }[];
   scene?: SceneState;
 }
 
@@ -78,9 +91,23 @@ export interface SceneContext {
   pendingMessages: number;
 }
 
+export type WorldType = 'auto' | 'xianxia' | 'urban' | 'apocalypse' | 'fantasy' | 'wuxia' | 'scifi' | 'palace' | 'academy' | 'modern' | 'generic';
+export type StateValue = string | number | boolean | null | StateValue[] | { [key: string]: StateValue };
+export interface MemoryFact { id: string; value: string; sourceMessageId?: string; confidence: number; confirmed: boolean; createdAt: string; }
+export interface StorySummary { id: string; rangeStart?: string; rangeEnd?: string; summary: string; facts: string[]; unresolved: string[]; createdAt: string; }
+export interface MemoryState { shortSummary: string; storySummaries: StorySummary[]; permanentFacts: MemoryFact[]; unresolved: string[]; hiddenCount: number; }
+export interface WorldState { lockedPaths?: string[]; sourceMessageId?: string; syncStatus?: 'idle' | 'updating' | 'failed'; syncError?: string; coverage?: string; chatId: string; revision: number; worldType: WorldType; world: Record<string, StateValue>; player: Record<string, StateValue>; characters: Record<string, Record<string, StateValue>>; relationships: Record<string, StateValue>; inventory: Record<string, StateValue>; location: Record<string, StateValue>; outfit: Record<string, StateValue>; memory: MemoryState; custom: Record<string, StateValue>; updatedAt: string; }
+export type StatePatchOp = 'set' | 'inc' | 'add' | 'del' | 'merge' | 'append';
+export interface StatePatch { op: StatePatchOp; path: string; value?: StateValue; key?: string; }
+export interface WorldStateEvent { id: string; chatId: string; messageId?: string; revision: number; patch: StatePatch[]; inversePatch: StatePatch[]; source: 'model' | 'manual' | 'rollback' | 'migration'; status: 'applied' | 'rejected' | 'partial'; createdAt: string; }
+export interface WorldStateSnapshot { chatId: string; messageId?: string; revision: number; state: WorldState; reason: 'generation' | 'swipe' | 'regenerate' | 'manual'; createdAt: string; }
+
 export interface VisualContext { key: string; snapshot: VisualSnapshot }
 
 export interface Chat {
+  forkedFrom?: { chatId: string; messageId: string; title: string };
+  userPersona?: UserPersona;
+  framing?: FramingMode;
   id: string;
   characterId: string;
   title: string;
@@ -126,6 +153,7 @@ export interface ImageJob {
 }
 
 export interface Asset {
+  personaId?: string;
   id: string;
   jobId?: string;
   characterId?: string;
@@ -141,6 +169,10 @@ export interface Asset {
 }
 
 export interface Settings {
+  textProtocol?: 'openai' | 'anthropic';
+  textPresetJson?: string;
+  textPresetName?: string;
+  textSystemPrompt?: string;
   textReasoningEffort?: 'default' | 'minimal' | 'low' | 'medium' | 'high';
   activeTextProfileId?: string;
   textProfileName?: string;
@@ -157,6 +189,10 @@ export interface Settings {
 }
 
 export interface TextModelProfile {
+  textProtocol?: 'openai' | 'anthropic';
+  textPresetJson?: string;
+  textPresetName?: string;
+  textSystemPrompt?: string;
   textReasoningEffort?: Settings['textReasoningEffort'];
   id: string;
   name: string;

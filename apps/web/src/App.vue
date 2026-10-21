@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue';
-import type { Asset, Bootstrap, Character, CharacterInput, Chat, ImageJob, Message, Settings, SceneState, StudioEvent, SystemStatus } from '@tavern/contracts';
+import type { Asset, Bootstrap, Character, CharacterInput, Chat, ImageJob, Message, Settings, SceneState, WorldState, StudioEvent, SystemStatus } from '@tavern/contracts';
 import { api, session, ApiError } from './api.ts';
 import Icon from './components/Icon.vue';
 import CharacterArt from './components/CharacterArt.vue';
 import CharacterModal from './components/CharacterModal.vue';
 import ImagePanel from './components/ImagePanel.vue';
+import WorldStatePanel from './components/WorldStatePanel.vue';
 import SettingsView from './components/SettingsView.vue';
 
 type View = 'chat' | 'characters' | 'gallery' | 'jobs' | 'settings';
@@ -15,8 +16,10 @@ const activeChatId = ref('');
 const messages = ref<Message[]>([]);
 const sourceMessage = ref<Message>();
 const inferenceRequest = ref(0);
-function drawMoment(message: Message) { sourceMessage.value = message; imagePanelOpen.value = true; inferenceRequest.value++; }
+function drawMoment(message: Message) { imagePanelHidden.value = false; applyAppearance(); sourceMessage.value = message; imagePanelOpen.value = true; inferenceRequest.value++; }
 const composer = ref('');
+const editingMessage = ref('');
+const editedContent = ref('');
 const search = ref('');
 const loading = ref(true);
 const connectionError = ref('');
@@ -30,6 +33,19 @@ const creatingImage = ref(false);
 const switchingModel = ref(false);
 const sidebarOpen = ref(false);
 const imagePanelOpen = ref(false);
+const imagePanelHidden = ref(false);
+function toggleImagePanel() {
+  if (window.matchMedia('(max-width: 1180px)').matches) {
+    imagePanelOpen.value = !imagePanelOpen.value;
+    if (imagePanelOpen.value) imagePanelHidden.value = false;
+  } else {
+    imagePanelHidden.value = !imagePanelHidden.value;
+    imagePanelOpen.value = false;
+  }
+  applyAppearance();
+}
+const theme = ref<'light' | 'dark'>('dark');
+const fontZoom = ref(100);
 const toast = ref('');
 const lightbox = ref<Asset>();
 const uploadInput = ref<HTMLInputElement>();
@@ -47,13 +63,49 @@ const activeChat = computed(() => state.value?.chats.find(chat => chat.id === ac
 const activeCharacter = computed(() => state.value?.characters.find(character => character.id === activeChat.value?.characterId) ?? state.value?.characters[0]);
 const filteredCharacters = computed(() => state.value?.characters.filter(character => `${character.name} ${character.tagline} ${character.tags.join(' ')}`.toLowerCase().includes(search.value.toLowerCase())) ?? []);
 const pendingJobs = computed(() => state.value?.jobs.filter(job => !['succeeded', 'failed', 'cancelled'].includes(job.status)) ?? []);
-const isStreaming = computed(() => messages.value.some(message => message.status === 'streaming'));
+const worldUpdate = ref<WorldState>();
+const worldBusy = ref(false);
+const isStreaming = computed(() => worldBusy.value || messages.value.some(message => message.status === 'streaming'));
 const textConfigured = computed(() => !!state.value?.settings.textUrl && !!state.value?.settings.textModel);
 const chatAssets = computed(() => state.value?.assets.filter(asset => asset.chatId === activeChatId.value) ?? []);
 const storyAssets = computed(() => [...chatAssets.value].sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
 const formatTime = (value: string) => new Date(value).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
 const characterName = (id?: string) => state.value?.characters.find(character => character.id === id)?.name ?? '自由创作';
 const terminal = (job: ImageJob) => ['succeeded', 'failed', 'cancelled'].includes(job.status);
+
+function applyAppearance() { document.documentElement.dataset.theme = theme.value; document.documentElement.style.zoom = `${fontZoom.value}%`; try { localStorage.setItem('tavern.theme', theme.value); localStorage.setItem('tavern.fontZoom', String(fontZoom.value)); localStorage.setItem('tavern.imagePanelHidden', String(imagePanelHidden.value)); } catch { } }
+function toggleTheme() { theme.value = theme.value === 'dark' ? 'light' : 'dark'; applyAppearance(); }
+function setFontZoom(value: string) { fontZoom.value = Number(value); applyAppearance(); }
+const deleteTarget = ref<Chat>();
+const deleteDialog = ref<HTMLDialogElement>();
+const deleteCancel = ref<HTMLButtonElement>();
+const deletingStory = ref(false);
+const deleteError = ref('');
+let deleteTrigger: HTMLElement | null = null;
+async function deleteChat(chat: Chat) {
+  deleteTrigger = document.activeElement as HTMLElement;
+  deleteTarget.value = chat; deleteError.value = '';
+  await nextTick(); deleteDialog.value?.showModal(); deleteCancel.value?.focus();
+}
+function closeDeleteDialog() {
+  if (deletingStory.value) return;
+  deleteDialog.value?.close(); deleteTarget.value = undefined;
+  if (deleteTrigger?.isConnected) deleteTrigger.focus();
+}
+async function confirmDeleteChat() {
+  const chat = deleteTarget.value;
+  if (!chat || deletingStory.value) return;
+  deletingStory.value = true; deleteError.value = '';
+  try {
+    await api(`/chats/${chat.id}`, 'DELETE');
+    state.value!.chats = state.value!.chats.filter(item => item.id !== chat.id);
+    state.value!.assets = state.value!.assets.filter(item => item.chatId !== chat.id);
+    state.value!.jobs = state.value!.jobs.filter(item => item.chatId !== chat.id);
+    if (activeChatId.value === chat.id) { activeChatId.value = ''; messages.value = []; navigate('chat'); }
+    deletingStory.value = false; closeDeleteDialog(); notify('故事记录已删除');
+  } catch (error) { deleteError.value = error instanceof Error ? error.message : '删除失败，请重试'; }
+  finally { deletingStory.value = false; }
+}
 
 function notify(message: string) { toast.value = message; clearTimeout(toastTimer); toastTimer = setTimeout(() => { toast.value = ''; }, 6500); }
 function failure(error: unknown) { notify(error instanceof Error ? error.message : '操作失败，请重试'); }
@@ -72,7 +124,10 @@ function applyEvent(event: StudioEvent) {
   if (event.type === 'settings.updated') settingsSaved(event.payload as Settings);
   state.value.eventCursor = event.id;
   if (event.type === 'character.updated') upsert(state.value.characters, event.payload as Character);
+  if (event.type === 'world_state.updated') { const next = event.payload as WorldState; if(next.chatId === activeChatId.value) worldUpdate.value = next; }
   if (event.type === 'chat.updated') upsert(state.value.chats, event.payload as Chat, true);
+  if (event.type === 'chat.deleted') { const id = (event.payload as { id: string }).id; state.value.chats = state.value.chats.filter(chat => chat.id !== id); if (activeChatId.value === id) { activeChatId.value = ''; messages.value = []; } }
+  if (event.type === 'chat.history_reset') { const reset = event.payload as { chatId: string; messages: Message[] }; if (activeChatId.value === reset.chatId) { messages.value = reset.messages; sourceMessage.value = undefined; } }
   if (event.type === 'message.updated') { const message = event.payload as Message; if (message.chatId === activeChatId.value) { upsert(messages.value, message); void scrollBottom(); } }
   if (event.type === 'job.updated') upsert(state.value.jobs, event.payload as ImageJob, true);
   if (event.type === 'asset.created') { upsert(state.value.assets, event.payload as Asset, true); void scrollBottom(); }
@@ -114,6 +169,8 @@ async function selectChat(id: string, switchView = true) {
   try {
     const result = await api<Message[]>(`/chats/${id}/messages`);
     if (version !== selectionVersion) return;
+    editingMessage.value = '';
+    worldBusy.value = false; worldUpdate.value = undefined;
     activeChatId.value = id;
     messages.value = result;
     sourceMessage.value = undefined;
@@ -177,14 +234,35 @@ async function sendMessage() {
   finally { sending.value = false; }
 }
 
+function editMessage(message: Message) { editingMessage.value = message.id; editedContent.value = message.content; }
+function retrySource(message: Message) { const index = messages.value.findIndex(m => m.id === message.id); return messages.value.slice(0, index).findLast(m => m.role === 'user'); }
+async function forkChat(message: Message) {
+  if (!activeChat.value || sending.value || isStreaming.value) return;
+  sending.value = true;
+  try {
+    const result = await api<{ chat: Chat }>(`/chats/${activeChat.value.id}/fork`, 'POST', { messageId: message.id, expectedChatRevision: activeChat.value.revision });
+    upsert(state.value!.chats, result.chat, true); editingMessage.value = ''; await selectChat(result.chat.id);
+    notify('已创建分支，可以继续聊天；原故事和图片保持不变');
+  } catch (error) { failure(error); } finally { sending.value = false; }
+}
+async function resend(message: Message, content: string) {
+  if (!activeChat.value || sending.value || !content.trim()) return;
+  sending.value = true;
+  try {
+    const result = await api<{ chat: Chat }>(`/chats/${activeChat.value.id}/resend`, 'POST', { messageId: message.id, content, expectedChatRevision: activeChat.value.revision });
+    upsert(state.value!.chats, result.chat, true); editingMessage.value = ''; await selectChat(result.chat.id); notify('已在当前故事重新生成，没有创建分支');
+  } catch (error) { failure(error); } finally { sending.value = false; }
+}
+async function retryReply(message: Message) { const user = retrySource(message); if (user) await resend(user, user.content); }
 async function stopText() { try { await api(`/chats/${activeChatId.value}/cancel`, 'POST', {}); } catch (error) { failure(error); } }
 function composerKey(event: KeyboardEvent) { if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); if (!isStreaming.value && textConfigured.value) void sendMessage(); } }
 
-async function generateImage(payload: { prompt: string; seed?: number; sourceMessageId?: string; characterId?: string; chatId?: string; visualContextKey?: string; scene?: SceneState; sceneContextKey?: string }) {
+async function generateImage(payload: { prompt: string; seed?: number; sourceMessageId?: string; characterId?: string; chatId?: string; visualContextKey?: string; scene?: SceneState; sceneContextKey?: string }, onQueued?: () => void) {
   creatingImage.value = true;
   try {
     const job = await api<ImageJob>('/image-jobs', 'POST', payload);
     upsert(state.value!.jobs, job, true);
+    onQueued?.();
     notify(status.value?.comfy.online ? '灵感已加入队列，可以继续浏览你的故事' : '任务已保存，启动 ComfyUI 后会自动执行');
   } catch (error) { failure(error); }
   finally { creatingImage.value = false; }
@@ -222,7 +300,7 @@ async function download(asset: Asset) {
 function onChatScroll() { const element = chatScroll.value; if (element) nearBottom = element.scrollHeight - element.scrollTop - element.clientHeight < 150; }
 
 onMounted(async () => {
-  try { activeChatId.value = localStorage.getItem('tavern.activeChat') ?? ''; } catch { }
+  try { activeChatId.value = localStorage.getItem('tavern.activeChat') ?? ''; theme.value = localStorage.getItem('tavern.theme') === 'light' ? 'light' : 'dark'; fontZoom.value = Number(localStorage.getItem('tavern.fontZoom') || 100); imagePanelHidden.value = localStorage.getItem('tavern.imagePanelHidden') === 'true'; applyAppearance(); } catch { }
   await reload();
   statusTimer = setInterval(() => { void refreshStatus(); }, 15000);
 });
@@ -239,12 +317,12 @@ onUnmounted(() => { closed = true; eventSource?.close(); clearTimeout(reconnectT
       <div class="sidebar-label">工作空间 <span>WORKSPACE</span></div>
       <nav class="navigation" aria-label="主导航"><button v-for="item in navigation" :key="item.id" :class="{ active: view === item.id }" @click="navigate(item.id)"><Icon :name="item.icon" :size="18" /><span>{{ item.label }}</span><span v-if="item.id === 'jobs' && pendingJobs.length" class="nav-count">{{ pendingJobs.length }}</span><span v-else-if="view === item.id" class="nav-active-dot"></span></button></nav>
       <div class="sidebar-section-heading"><span>最近的故事</span><Icon name="clock" :size="13" /></div>
-      <div class="recent-chats"><button v-for="chat in state?.chats.slice(0, 7)" :key="chat.id" :class="{ selected: activeChatId === chat.id && view === 'chat' }" @click="selectChat(chat.id)"><span class="tiny-avatar" :class="state?.characters.find(character => character.id === chat.characterId)?.color">{{ characterName(chat.characterId).slice(0, 1) }}</span><span><strong>{{ chat.title }}</strong><small>{{ formatTime(chat.updatedAt) }}</small></span></button><p v-if="!state?.chats.length" class="sidebar-empty">还没有故事。<br />一次问候，就足够开始。</p></div>
+      <div class="recent-chats"><div v-for="chat in state?.chats" :key="chat.id" class="recent-chat-row" :class="{ selected: activeChatId === chat.id && view === 'chat' }"><button class="recent-chat-open" :title="chat.title" @click="selectChat(chat.id)"><span class="tiny-avatar" :class="state?.characters.find(character => character.id === chat.characterId)?.color">{{ characterName(chat.characterId).slice(0, 1) }}</span><span class="recent-chat-label"><strong>{{ chat.title }}</strong><small>{{ formatTime(chat.updatedAt) }}</small></span></button><button type="button" class="chat-delete" :aria-label="`删除故事：${chat.title}`" title="删除故事" @click="deleteChat(chat)">×</button></div><p v-if="!state?.chats.length" class="sidebar-empty">还没有故事。<br />一次问候，就足够开始。</p></div>
       <div class="sidebar-bottom"><div class="local-space"><span class="status-dot online"></span><div><strong>你的私人创作空间</strong><small>本机存储 · 无后台遥测</small></div><Icon name="leaf" :size="16" /></div><button class="settings-nav" :class="{ active: view === 'settings' }" @click="navigate('settings')"><Icon name="sliders" :size="18" /><span>模型与设置</span><span class="keyboard-shortcut">↗</span></button><div class="sidebar-version">Tavern Studio <span>v0.1.0 · 研究预览版</span></div></div>
     </aside>
 
     <div class="workspace">
-      <header class="topbar"><div class="breadcrumb"><button class="icon-button mobile-menu" aria-label="展开导航" @click="sidebarOpen = !sidebarOpen"><Icon name="menu" /></button><span>工作空间</span><Icon name="chevron" :size="12" /><strong>{{ titles[view] }}</strong></div><div class="topbar-actions"><span class="connection-badge" :class="{ connected: status?.comfy.online }"><span class="status-dot" :class="status?.comfy.online ? 'online' : 'offline'" />{{ status?.comfy.online ? '图像引擎就绪' : '图像引擎离线' }}</span><button v-if="view === 'chat' || view === 'characters'" class="icon-button mobile-image-button" aria-label="打开生图面板" @click="imagePanelOpen = !imagePanelOpen"><Icon name="image" :size="18" /></button><button class="icon-button" aria-label="模型设置" @click="navigate('settings')"><Icon name="sliders" :size="18" /></button><span class="profile-avatar" title="本机单用户">我</span></div></header>
+      <header class="topbar"><div class="breadcrumb"><button class="icon-button mobile-menu" aria-label="展开导航" @click="sidebarOpen = !sidebarOpen"><Icon name="menu" /></button><span>工作空间</span><Icon name="chevron" :size="12" /><strong>{{ titles[view] }}</strong></div><div class="topbar-actions"><button class="appearance-button" :aria-label="theme === 'dark' ? '切换为日间模式' : '切换为夜间模式'" :title="theme === 'dark' ? '切换为日间模式' : '切换为夜间模式'" @click="toggleTheme">{{ theme === 'dark' ? '☀︎' : '☾' }}</button><select class="zoom-select" aria-label="字号大小" :value="fontZoom" @change="setFontZoom(($event.target as HTMLSelectElement).value)"><option value="90">小字</option><option value="100">标准</option><option value="110">大字</option><option value="120">特大</option></select><span class="connection-badge" :class="{ connected: status?.comfy.online }"><span class="status-dot" :class="status?.comfy.online ? 'online' : 'offline'" /><span>{{ status?.comfy.online ? '生图已连接' : '生图未启动' }}</span></span><button v-if="view === 'chat' || view === 'characters'" class="icon-button image-panel-toggle" aria-label="展开或收起生图面板" title="展开或收起生图面板" aria-controls="studio-image-panel" @click="toggleImagePanel"><Icon name="image" :size="18" /></button><button class="icon-button" aria-label="模型设置" title="模型设置" @click="navigate('settings')"><Icon name="sliders" :size="18" /></button><span class="profile-avatar" title="本机单用户">我</span></div></header>
       <div v-if="loading" class="loading-state"><span class="loading-orbit"></span><p>正在打开你的故事空间…</p></div>
       <div v-else-if="connectionError" class="empty-state"><Icon name="info" :size="36" /><h2>还没有连接上本地服务</h2><p>{{ connectionError }}</p><button class="button primary" @click="reload">重新连接</button></div>
       <div v-else-if="state" class="workspace-body" :class="{ 'with-panel': view === 'chat' || view === 'characters' }">
@@ -261,8 +339,8 @@ onUnmounted(() => { closed = true; eventSource?.close(); clearTimeout(reconnectT
           <section v-else-if="view === 'chat' && activeChat && activeCharacter" class="chat-view">
             <header class="chat-header"><select class="chat-model-select" aria-label="当前文本模型" :value="state.settings.activeTextProfileId" :disabled="isStreaming || sending || switchingModel" @change="switchTextModel"><option v-for="profile in state.settings.textProfiles" :key="profile.id" :value="profile.id">{{ profile.name }}</option></select><span class="chat-avatar tiny-avatar" :class="activeCharacter.color"><img v-if="activeCharacter.avatarId" :src="`/api/v1/media/${activeCharacter.avatarId}`" :alt="activeCharacter.name" /><template v-else>{{ activeCharacter.name.slice(0, 1) }}</template></span><div><h1>{{ activeCharacter.name }}</h1><p>{{ activeCharacter.tagline }}</p></div><button class="icon-button" aria-label="编辑当前角色" @click="editCharacter(activeCharacter)"><Icon name="edit" :size="17" /></button><button class="button secondary small" @click="beginChat(activeCharacter)"><Icon name="plus" :size="15" />新对话</button></header>
             <div v-if="!textConfigured" class="setup-banner"><Icon name="info" :size="17" /><span>文字引擎尚未连接。你可以先浏览角色，或直接用右侧面板生成图片。</span><button class="text-button" @click="navigate('settings')">去设置 <Icon name="arrow" :size="14" /></button></div>
-            <div ref="chatScroll" class="chat-messages" aria-live="polite" aria-relevant="additions text" @scroll="onChatScroll"><div class="conversation-start"><span></span><p>一段新的故事，从此刻开始</p><span></span></div><article v-for="message in messages" :key="message.id" class="message" :class="[message.role, { selected: sourceMessage?.id === message.id }]"><span class="message-avatar" :class="message.role === 'user' ? 'user-avatar' : activeCharacter.color">{{ message.role === 'user' ? '我' : activeCharacter.name.slice(0, 1) }}</span><div class="message-body"><div class="message-meta"><strong>{{ message.role === 'user' ? '你' : activeCharacter.name }}</strong><span>{{ formatTime(message.createdAt) }}</span><small v-if="message.status === 'streaming'" class="streaming-label">正在书写…</small><small v-else-if="message.status === 'interrupted'">已中止</small></div><p class="message-content">{{ message.content }}<span v-if="message.status === 'streaming'" class="typing-cursor">▍</span></p><p v-if="message.error" class="message-error">{{ message.error }}</p><div class="message-images"><button v-for="asset in chatAssets.filter(item => item.sourceMessageId === message.id)" :key="asset.id" @click="lightbox = asset"><img :src="`/api/v1/media/${asset.id}`" :alt="asset.prompt" loading="lazy" /></button></div><div v-if="message.content && message.status !== 'streaming'" class="message-actions"><button class="text-button" @click="copy(message.content)"><Icon name="copy" :size="13" />复制</button><button class="text-button" :class="{ 'source-selected': sourceMessage?.id === message.id }" @click="drawMoment(message)"><Icon name="image" :size="13" />绘制这一刻</button></div></div></article><div v-if="storyAssets.length" class="conversation-gallery"><span class="eyebrow">这个故事里的画面</span><div><button v-for="asset in storyAssets" :key="asset.id" @click="lightbox = asset"><img :src="`/api/v1/media/${asset.id}`" :alt="asset.prompt" /></button></div></div></div>
-            <div class="composer-container"><form class="composer" @submit.prevent="sendMessage"><textarea v-model="composer" rows="2" maxlength="12000" :disabled="!textConfigured" :placeholder="textConfigured ? '说点什么，让故事继续…' : '请先在设置中连接文本模型'" aria-label="聊天消息" @keydown="composerKey" /><div class="composer-bottom"><span><Icon name="leaf" :size="14" />{{ state.settings.allowCloud ? '文本使用你配置的服务' : '文本仅允许本机接口' }}</span><button v-if="isStreaming" type="button" class="send-button stop-button" aria-label="停止生成" @click="stopText"><Icon name="stop" :size="17" /></button><button v-else class="send-button" :disabled="!composer.trim() || sending || !textConfigured" aria-label="发送消息"><Icon name="send" :size="20" /></button></div></form><div class="composer-hint">Enter 发送 · Shift + Enter 换行<span>故事由你与 AI 共同创作，请独立判断回复。</span></div></div>
+            <div v-if="activeChat?.forkedFrom" class="branch-origin"><span>分支自 {{ activeChat.forkedFrom.title }} · 独立剧情分支</span><button v-if="state?.chats.some(c => c.id === activeChat?.forkedFrom?.chatId)" class="text-button" @click="selectChat(activeChat.forkedFrom.chatId)">返回原故事 ↗</button></div><WorldStatePanel v-if="activeChat" :key="activeChat.id" :chat-id="activeChat.id" :update="worldUpdate" @busy="worldBusy = $event" /><div ref="chatScroll" class="chat-messages" aria-live="polite" aria-relevant="additions text" @scroll="onChatScroll"><div class="conversation-start"><span></span><p>一段新的故事，从此刻开始</p><span></span></div><article v-for="message in messages" :key="message.id" class="message" :class="[message.role, { selected: sourceMessage?.id === message.id }]"><span class="message-avatar" :class="message.role === 'user' ? 'user-avatar' : activeCharacter.color">{{ message.role === 'user' ? '我' : activeCharacter.name.slice(0, 1) }}</span><div class="message-body"><div class="message-meta"><strong>{{ message.role === 'user' ? '你' : activeCharacter.name }}</strong><span>{{ formatTime(message.createdAt) }}</span><small v-if="message.status === 'streaming'" class="streaming-label">正在书写…</small><small v-else-if="message.status === 'interrupted'">已中止</small></div><div v-if="editingMessage === message.id" class="message-editor"><textarea v-model="editedContent" rows="5" maxlength="12000" aria-label="编辑消息" /><p class="field-hint">在当前故事替换这条消息及后续对话。要保留另一条剧情，请先点击“从这里分支”。已有图片保留。</p><button class="button primary small" :disabled="sending || isStreaming || !editedContent.trim()" @click="resend(message, editedContent)">保存并重新发送</button><button class="button secondary small" :disabled="sending" @click="editingMessage = ''">取消</button></div><p v-else class="message-content">{{ message.content }}<span v-if="message.status === 'streaming'" class="typing-cursor">▍</span></p><p v-if="message.error" class="message-error">{{ message.error }}</p><div class="message-images"><button v-for="asset in chatAssets.filter(item => item.sourceMessageId === message.id)" :key="asset.id" @click="lightbox = asset"><img :src="`/api/v1/media/${asset.id}`" :alt="asset.prompt" loading="lazy" /></button></div><div v-if="message.status !== 'streaming'" class="message-actions"><button v-if="message.role === 'user'" class="text-button" :disabled="sending || isStreaming" @click="editMessage(message)">编辑并重发</button><button v-else-if="retrySource(message)" class="text-button" :disabled="sending || isStreaming" @click="retryReply(message)">重新生成</button><button v-if="message.status === 'complete'" class="text-button" :disabled="sending || isStreaming" title="保留截至此处的对话，创建独立故事，不自动生成回复" @click="forkChat(message)">从这里分支</button><button class="text-button" @click="copy(message.content)"><Icon name="copy" :size="13" />复制</button><button class="text-button" :class="{ 'source-selected': sourceMessage?.id === message.id }" @click="drawMoment(message)"><Icon name="image" :size="13" />绘制这一刻</button></div></div></article><div v-if="storyAssets.length" class="conversation-gallery"><span class="eyebrow">这个故事里的画面</span><div><button v-for="asset in storyAssets" :key="asset.id" @click="lightbox = asset"><img :src="`/api/v1/media/${asset.id}`" :alt="asset.prompt" /></button></div></div></div>
+            <div class="composer-container"><form class="composer" @submit.prevent="sendMessage"><textarea v-model="composer" rows="2" maxlength="12000" :disabled="!textConfigured" :placeholder="textConfigured ? '说点什么，让故事继续…' : '请先在设置中连接文本模型'" aria-label="聊天消息" @keydown="composerKey" /><div class="composer-bottom"><span><Icon name="leaf" :size="14" />{{ worldBusy ? '正在整理世界状态，可停止' : state.settings.allowCloud ? '文本使用你配置的服务' : '文本仅允许本机接口' }}</span><button v-if="isStreaming" type="button" class="send-button stop-button" :aria-label="worldBusy ? '停止整理状态' : '停止生成'" @click="stopText"><Icon name="stop" :size="17" /></button><button v-else class="send-button" :disabled="!composer.trim() || sending || !textConfigured" aria-label="发送消息"><Icon name="send" :size="20" /></button></div></form><div class="composer-hint">Enter 发送 · Shift + Enter 换行<span>故事由你与 AI 共同创作，请独立判断回复。</span></div></div>
           </section>
 
           <section v-else-if="view === 'gallery'" class="page-content gallery-view"><div class="page-intro"><span class="eyebrow">MOMENTS MADE VISIBLE</span><h1>把想象，留在这里。</h1><p>每一张图片，都连着一个值得记住的故事。</p></div><div class="section-heading"><h2>所有画面 <span>{{ state.assets.length }}</span></h2><span class="muted small-text">默认下载不含内部工作流元数据</span></div><div v-if="state.assets.length" class="gallery-grid"><article v-for="asset in state.assets" :key="asset.id" class="gallery-card"><button class="gallery-image-button" @click="lightbox = asset"><img :src="`/api/v1/media/${asset.id}`" :alt="asset.prompt" loading="lazy" /><span><Icon name="arrow" :size="20" />查看画面</span></button><div><span>{{ characterName(asset.characterId) }}</span><button class="icon-button" aria-label="下载图片" @click="download(asset)"><Icon name="download" :size="16" /></button><p>{{ asset.prompt }}</p><small>{{ formatTime(asset.createdAt) }} · {{ asset.width }} × {{ asset.height }}</small></div></article></div><div v-else class="empty-state gallery-empty"><div class="empty-visual"><Icon name="image" :size="44" /><span>✧</span></div><h2>第一幅画面，还在你的想象里。</h2><p>去工作台写下画面描述，<br />你的创作会被妥善保存在这里。</p><button class="button secondary" @click="navigate('chat')">去创作<Icon name="arrow" :size="16" /></button></div></section>
@@ -271,11 +349,19 @@ onUnmounted(() => { closed = true; eventSource?.close(); clearTimeout(reconnectT
 
           <SettingsView v-else-if="view === 'settings'" :settings="state.settings" @saved="settingsSaved" @notify="notify" />
         </main>
-        <ImagePanel v-if="view === 'chat' || view === 'characters'" :class="{ 'mobile-open': imagePanelOpen }" :character="activeCharacter" :chat-id="view === 'chat' ? activeChat?.id : undefined" :chat-revision="activeChat?.revision" :inference-request="inferenceRequest" :assets="state.assets" :chatting="isStreaming || sending" :source="view === 'chat' ? sourceMessage : undefined" :jobs="state.jobs" :settings="state.settings" :connected="!!status?.comfy.online" :busy="creatingImage" @generate="generateImage" @edit-character="editCharacter(activeCharacter)" @chat-saved="upsert(state.chats, $event)" @notify="notify" @settings="navigate('settings')" @queue="navigate('jobs')" @clear-source="sourceMessage = undefined" @close="imagePanelOpen = false" />
+        <ImagePanel id="studio-image-panel" v-if="!imagePanelHidden && (view === 'chat' || view === 'characters')" :class="{ 'mobile-open': imagePanelOpen }" :character="activeCharacter" :chat="view === 'chat' ? activeChat : undefined" :chat-id="view === 'chat' ? activeChat?.id : undefined" :chat-revision="activeChat?.revision" :inference-request="inferenceRequest" :assets="state.assets" :chatting="isStreaming || sending" :source="view === 'chat' ? sourceMessage : undefined" :jobs="state.jobs" :settings="state.settings" :connected="!!status?.comfy.online" :busy="creatingImage" @generate="generateImage" @edit-character="editCharacter(activeCharacter)" @chat-saved="upsert(state.chats, $event)" @notify="notify" @settings="navigate('settings')" @queue="navigate('jobs')" @clear-source="sourceMessage = undefined" @close="imagePanelOpen = false" />
       </div>
     </div>
     <input ref="uploadInput" class="visually-hidden" type="file" accept=".json,.png" aria-label="导入角色卡文件" @change="importCard" />
   </div>
+  <dialog ref="deleteDialog" class="delete-dialog" aria-labelledby="delete-story-title" aria-describedby="delete-story-description" :aria-busy="deletingStory" @cancel.prevent="closeDeleteDialog">
+    <div class="delete-dialog-symbol" aria-hidden="true"><Icon name="info" :size="24" /></div>
+    <h2 id="delete-story-title">删除这个故事？</h2>
+    <p class="delete-story-name">{{ deleteTarget?.title }}</p>
+    <p id="delete-story-description">这个故事的聊天记录、生成图片和任务记录将被永久删除，无法恢复。其他故事不受影响。</p>
+    <p v-if="deleteError" class="delete-dialog-error" role="alert">{{ deleteError }}</p>
+    <div class="delete-dialog-actions"><button ref="deleteCancel" type="button" class="button secondary" :disabled="deletingStory" @click="closeDeleteDialog">取消</button><button type="button" class="button delete-confirm" :disabled="deletingStory" @click="confirmDeleteChat">{{ deletingStory ? '正在删除…' : '确认删除' }}</button></div>
+  </dialog>
   <CharacterModal v-if="showEditor" :character="editingCharacter" :assets="state?.assets" :saving="saving" @close="showEditor = false" @save="saveCharacter" />
   <div v-if="lightbox" class="modal-backdrop" @click.self="lightbox = undefined" @keydown.esc="lightbox = undefined"><section class="modal lightbox" role="dialog" aria-modal="true" aria-label="查看生成图片" tabindex="-1"><button class="icon-button lightbox-close" aria-label="关闭图片" autofocus @click="lightbox = undefined"><Icon name="close" /></button><img :src="`/api/v1/media/${lightbox.id}`" :alt="lightbox.prompt" /><div class="lightbox-info"><span class="eyebrow">{{ characterName(lightbox.characterId) }}</span><p>{{ lightbox.prompt }}</p><div><span>{{ lightbox.width }} × {{ lightbox.height }} · Seed {{ lightbox.seed }}</span><button class="button primary small" @click="download(lightbox)"><Icon name="download" :size="15" />下载图片</button></div></div></section></div>
   <Transition name="toast"><div v-if="toast" class="toast-message" role="status"><Icon name="info" :size="18" /><span>{{ toast }}</span><button class="icon-button" aria-label="关闭提示" @click="toast = ''"><Icon name="close" :size="15" /></button></div></Transition>

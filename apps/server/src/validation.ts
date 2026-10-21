@@ -1,3 +1,4 @@
+import { parseChatPreset } from './chat-preset.ts';
 import { isIP } from 'node:net';
 import { AppError } from './errors.ts';
 import type { CharacterInput, Settings } from '@tavern/contracts';
@@ -50,17 +51,26 @@ export function endpoint(value: unknown, localOnly: boolean): string {
 
 export function settingsInput(value: unknown, previous: Settings): Settings {
   const body = object(value);
+  const protocol = body.textProtocol ?? previous.textProtocol ?? 'openai';
+  if (!['openai', 'anthropic'].includes(String(protocol))) throw new AppError(400, 'INVALID_INPUT', '不支持的接口协议');
   const reasoning = body.textReasoningEffort ?? 'default';
   if (!['default', 'minimal', 'low', 'medium', 'high'].includes(String(reasoning))) throw new AppError(400, 'INVALID_INPUT', '不支持的思考级别');
   for (const key of ['allowCloud', 'researchUseConfirmed']) {
     if (typeof body[key] !== 'boolean') throw new AppError(400, 'INVALID_INPUT', `${key} 必须是布尔值`);
   }
   if (typeof body.temperature !== 'number' || body.temperature < 0 || body.temperature > 2) throw new AppError(400, 'INVALID_INPUT', '温度范围为 0～2');
-  const maxTokens = integer(body.maxTokens, '输出长度', 64, 4096);
-  const contextWindow = integer(body.contextWindow, '上下文长度', 2048, 131072);
+  const maxTokens = integer(body.maxTokens, '输出长度', 64, 131072);
+  const textPresetJson = body.textPresetJson ?? previous.textPresetJson ?? '';
+  if (typeof textPresetJson !== 'string') throw new AppError(400, 'INVALID_INPUT', '预设 JSON 必须是文本');
+  if (textPresetJson) parseChatPreset(textPresetJson);
+  const contextWindow = integer(body.contextWindow, '上下文长度', 2048, 1048576);
   if (maxTokens + 512 >= contextWindow) throw new AppError(400, 'INVALID_INPUT', '上下文长度必须大于输出长度与安全余量');
   return {
     ...previous,
+    textProtocol: protocol as Settings['textProtocol'],
+    textPresetJson,
+    textPresetName: text(body.textPresetName ?? previous.textPresetName ?? '', '聊天预设名称', 120),
+    textSystemPrompt: text(body.textSystemPrompt ?? previous.textSystemPrompt ?? '', '聊天预设', 40000),
     textReasoningEffort: reasoning as Settings['textReasoningEffort'],
     comfyUrl: endpoint(body.comfyUrl, true),
     textUrl: body.textUrl ? endpoint(body.textUrl, !body.allowCloud) : '',

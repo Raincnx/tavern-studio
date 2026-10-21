@@ -24,7 +24,7 @@ function addPerson() {
       <label class="field">称呼<input v-model="person.name" maxlength="80" @input="emit('change')" /></label>
       <label><input v-model="person.inFrame" type="checkbox" @change="emit('change')" /> 出现在镜头内</label>
       <label v-for="field in fields" :key="field.key" class="field">{{ field.label }}<small :title="person[field.key].sourceMessageId ? `来源消息：${person[field.key].sourceMessageId}` : '无明确剧情来源'">{{ labels[person[field.key].basis] }}</small><textarea v-model="person[field.key].value" rows="2" maxlength="800" @input="edited(person[field.key])" /></label>
-      <button v-if="person.id !== 'main'" class="text-button" @click="state.people = state.people.filter(item => item.id !== person.id); emit('change')">移除此人物</button>
+      <button v-if="person.id !== 'main' && person.id !== 'user'" class="text-button" @click="state.people = state.people.filter(item => item.id !== person.id); emit('change')">移除此人物</button>
     </details>
     <button v-if="state.people.length < 4" class="text-button" @click="addPerson">添加人物</button>
   </section>

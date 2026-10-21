@@ -37,7 +37,15 @@ export function visualContext(store: Store, character: Character, chat?: Chat, s
     if (role === 'outfit' && references.some(reference => reference.assetId === assetId)) continue;
     if (assetId) { checkReference(store, character.id, assetId); references.push({ role, assetId }); }
   }
-  const snapshot: VisualSnapshot = { characterId: character.id, characterRevision: character.revision, identity: character.visual?.identity || character.appearance, outfit, references };
+  if (chat?.userPersona) {
+    const persona = chat.userPersona;
+    for (const [role, assetId] of [['face', persona.visual.faceAssetId], ['body', persona.visual.bodyAssetId], ['outfit', persona.visual.outfitAssetId]] as const) {
+      if (!assetId || references.some(reference => reference.assetId === assetId && reference.personId === 'user')) continue;
+      if (store.get<Asset>('assets', assetId)?.personaId !== persona.id) throw new AppError(400, 'REFERENCE_INVALID', '用户参考图不属于已绑定人设');
+      references.push({ role, assetId, personId: 'user' });
+    }
+  }
+  const snapshot: VisualSnapshot = { characterId: character.id, characterRevision: character.revision, identity: character.visual?.identity || character.appearance, outfit, references, ...(chat?.userPersona ? { userPersona: chat.userPersona, framing: chat.framing ?? 'auto' } : {}) };
   return { key: createHash('sha256').update(JSON.stringify(snapshot)).digest('hex'), snapshot };
 }
 
@@ -61,7 +69,7 @@ export function renderScenePrompt(visual: VisualSnapshot): string {
       known(person.expression.value) ? `表情为${person.expression.value}` : '',
       known(person.props.value) ? `相关道具为${person.props.value}` : '',
     ].filter(Boolean);
-    lines.push(`${person.name}（${person.id === 'main' ? '主角' : '独立配角'}）：${details.length ? details.join('；') : '按已确认身份呈现，不增添未经描述的动作与服装细节'}。`);
+    lines.push(`${person.name}（${person.id === 'main' ? '主角 main' : person.id === 'user' ? '用户人物 user' : '独立配角'}）：${details.length ? details.join('；') : '按已确认身份呈现，不增添未经描述的动作与服装细节'}。`);
   }
   if (known(state.interaction.value)) lines.push(`空间关系与接触：${state.interaction.value}。`);
   const offscreen = state.people.filter(person => !person.inFrame);
@@ -73,10 +81,12 @@ export function renderScenePrompt(visual: VisualSnapshot): string {
 export function compileVisualPrompt(scene: string, visual?: VisualSnapshot): string {
   if (!visual) return scene;
   const roles = { face: '主角 main 的稳定五官与面部身份，不复制表情、眼镜佩戴状态或发型整理方式', body: '主角 main 的自然身体比例，不复制姿势、服装、背景或其他人物', outfit: '主角 main 当前服装的款式、颜色与材质，不复制姿势和穿着状态' };
-  const refs = visual.references.map((reference, index) => `<image${index + 1}> 仅用于${roles[reference.role]}。`).join('\n');
+  const refs = visual.references.map((reference, index) => `<image${index + 1}> 仅用于${reference.personId === 'user' ? roles[reference.role].replace('主角 main', `用户人物 user（${visual.userPersona?.name ?? '用户'}）`) : roles[reference.role]}。`).join('\n');
   return [refs,
-    '所有参考图只绑定主角 main，不代表画面只有一个人。其他人物有独立身份与身体，不套用主角的脸。生成一幅连贯的剧情画面，不生成拼图或人物设定表。',
+    visual.userPersona ? '参考图严格绑定各自标注的人物编号。main 与 user 是两个独立身份，不交换脸、衣服、身体或道具；左右位置改变不改变身份。生成单幅连贯画面，不生成拼图或人物设定表。' : '所有参考图只绑定主角 main，不代表画面只有一个人。其他人物有独立身份与身体，不套用主角的脸。生成一幅连贯的剧情画面，不生成拼图或人物设定表。',
     visual.scene && !visual.scene.people.find(person => person.id === 'main')?.inFrame ? '主角在镜头外，不使用主角身份约束其他人物。' : `主角稳定身份（仅采用五官、肤色、年龄段、自然身体比例与辨识特征；忽略其中的服装、姿势、表情、背景及夸张比例要求）：${visual.identity}`,
+    visual.userPersona && (!visual.scene || visual.scene.people.find(person => person.id === 'user')?.inFrame) ? `用户人物 user（${visual.userPersona.name}）的稳定身份：${visual.userPersona.visual.identity || '外貌未明确，不复制 main 的脸或编造具体辨识特征'}。${!visual.scene ? `默认服装：${visual.userPersona.visual.outfit || '未明确'}。` : ''}` : '',
+    visual.framing === 'pov' ? '镜头位于用户人物 user 的视点，main 是独立的对面人物；不绘制 user 的完整身体或无依据的手臂。' : '',
     visual.scene ? renderScenePrompt(visual) : `服装基准：${visual.outfit.description || '沿用已有服装依据'}。明确的新换装覆盖基准；穿着方式、发型状态、表情和动作按本次画面。\n本次画面：${scene}`,
     visual.scene && scene.trim() && scene.trim() !== '按当前画面状态生成' ? `画面补充（不得改变上方明确的人数、身份与状态）：${scene}` : '',
     '画面不添加字幕、水印、说明文字或多格分镜；剧情明确出现的书籍、招牌等场内文字除外。按每个人的位置分别构建自然、连贯的人体。四肢归属清楚，接触点与遮挡合理，被遮挡的部位不重复补画。不将镜头外人物的身体拼接到入镜人物身上，不夸张或重复臀胯。',

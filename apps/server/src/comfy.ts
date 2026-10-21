@@ -10,9 +10,11 @@ export interface ComfyQueue { queue_running: unknown[][]; queue_pending: unknown
 
 export function loadWorkflow(path: string): Graph {
   const graph = JSON.parse(readFileSync(path, 'utf8')) as Graph;
-  const expected: Record<string, string> = { '451': 'UNETLoader', '454': 'VAELoader', '452': 'TextEncodeQwenImage21', '456': 'EmptyLatentImage', '480': 'QwenImage21Cache', '458': 'KSampler', '457': 'VAEDecode', '461': 'SaveImage' };
+  const expected: Record<string, string> = { '451': 'UNETLoader', '454': 'VAELoader', '456': 'EmptyLatentImage', '480': 'QwenImage21Cache', '458': 'KSampler', '457': 'VAEDecode', '461': 'SaveImage' };
   for (const [node, classType] of Object.entries(expected)) if (graph[node]?.class_type !== classType) throw new Error(`工作流节点 ${node} 不匹配 ${classType}`);
   if (!['CLIPLoader', 'TavernQwen21CLIPLoaderGGUF'].includes(graph['453']?.class_type)) throw new Error('工作流文本编码器节点不受支持');
+  if (!['TextEncodeQwenImage21', 'TavernQwen21TextEncodeStaged'].includes(graph['452']?.class_type)) throw new Error('工作流画面编码节点不受支持');
+  if (graph['453'].class_type === 'TavernQwen21CLIPLoaderGGUF' && graph['453'].inputs.execution_device === 'cuda' && graph['452'].class_type !== 'TavernQwen21TextEncodeStaged') throw new Error('GPU GGUF 编码必须使用分阶段卸载节点');
   if (graph['451'].inputs.unet_name !== 'qwen_image_2.1_int8_convrot.safetensors') throw new Error('工作流不是已确认的标准版模型');
   return graph;
 }

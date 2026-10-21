@@ -14,6 +14,34 @@ async function reference(studio: Awaited<ReturnType<typeof fixture>>, character:
   return response.json<Asset>();
 }
 
+test('reference editing rejects known source seeds without queuing and preserves unrelated seeds', async t => {
+  const studio = await fixture(t);
+  studio.store.saveSettings({ ...studio.store.settings(), researchUseConfirmed: true });
+  const character = studio.store.list<Character>('characters')[0];
+  const imported = await reference(studio, character);
+  const generated = await reference(studio, character);
+  studio.store.saveAsset({ ...generated, jobId: crypto.randomUUID(), seed: 42 });
+  character.visual = { identity: '蓝眼睛', outfit: '白衬衫', faceAssetId: imported.id, bodyAssetId: generated.id };
+  studio.store.saveCharacter(character);
+  const payload = { characterId: character.id, prompt: '改为蓝色外套' };
+  const rejected = await studio.call('/image-jobs', 'POST', { ...payload, seed: 42 });
+  assert.equal(rejected.statusCode, 409);
+  assert.match(rejected.body, /REFERENCE_SEED_CONFLICT/);
+  assert.equal(studio.store.list<ImageJob>('image_jobs').length, 0);
+  for (const seed of [0, 43, undefined]) {
+    const response = await studio.call('/image-jobs', 'POST', { ...payload, ...(seed === undefined ? {} : { seed }) });
+    assert.equal(response.statusCode, 202);
+    const job = response.json<ImageJob>();
+    assert.notEqual(job.seed, 42);
+    if (seed !== undefined) assert.equal(job.seed, seed); // Imported assets' placeholder 0 is not provenance.
+    const row = studio.store.db.prepare('SELECT graph FROM job_workflows WHERE job_id=?').get(job.id) as { graph: string };
+    assert.equal((JSON.parse(row.graph) as Graph)['458'].inputs.seed, job.seed);
+  }
+  const plain = await studio.call('/image-jobs', 'POST', { prompt: '蓝色杯子', seed: 42 });
+  assert.equal(plain.statusCode, 202);
+  assert.equal(plain.json<ImageJob>().seed, 42);
+});
+
 test('reference uploads are cleaned, ownership is enforced and cards export portable visual text', async t => {
   const studio = await fixture(t);
   const [character, other] = studio.store.list<Character>('characters');

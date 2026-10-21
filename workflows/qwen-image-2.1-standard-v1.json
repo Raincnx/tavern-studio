@@ -10,7 +10,8 @@
     "class_type": "TavernQwen21CLIPLoaderGGUF",
     "inputs": {
       "clip_name": "Qwen-Image-2.1-Turbo-Uncensored-Q8_0.gguf",
-      "vision_name": "qwen3vl_8b_int8_convrot.safetensors"
+      "vision_name": "qwen3vl_8b_int8_convrot.safetensors",
+      "execution_device": "cuda"
     }
   },
   "454": {
@@ -20,7 +21,7 @@
     }
   },
   "452": {
-    "class_type": "TextEncodeQwenImage21",
+    "class_type": "TavernQwen21TextEncodeStaged",
     "inputs": {
       "clip": [
         "453",
