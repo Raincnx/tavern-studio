@@ -99,8 +99,9 @@ test('unconfigured text provider does not create phantom messages', async contex
 test('text SSE is decoded, persisted and replayed without duplicating a retry', async context => {
   const studio = await fixture(context);
   let requests = 0;
-  const url = await mockServer(context, (request, response) => {
+  const url = await mockServer(context, (request, response, body) => {
     if (request.url === '/v1/chat/completions') {
+      if(!body.stream) {response.writeHead(200,{'content-type':'application/json'}).end(JSON.stringify({choices:[{message:{content:'{"patches":[]}'},finish_reason:'stop'}]}));return;}
       requests++;
       response.writeHead(200, { 'content-type': 'text/event-stream' });
       const data = Buffer.from(`data: ${JSON.stringify({ choices: [{ delta: { content: '你好，旅人。' } }] })}\r\n\r\ndata: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] })}\r\n\r\ndata: [DONE]\r\n\r\n`);
@@ -108,7 +109,7 @@ test('text SSE is decoded, persisted and replayed without duplicating a retry', 
     }
     response.writeHead(404).end();
   });
-  studio.store.saveSettings({ ...studio.store.settings(), textUrl: `${url}/v1`, textModel: 'test-model' });
+  studio.store.saveSettings({ ...studio.store.settings(), textUrl: `${url}/v1`, textModel: 'test-model', contextWindow:32768 });
   const chat = (await studio.call('/chats', 'POST', { characterId: studio.store.list<Character>('characters')[0].id })).json<Chat>();
   const key = crypto.randomUUID();
   const body = { content: '你好', expectedChatRevision: chat.revision };
@@ -130,9 +131,10 @@ test('interrupted provider stream keeps the partial reply', async context => {
     response.write(`data: ${JSON.stringify({ choices: [{ delta: { content: '已经收到的一段文字' } }] })}\n\n`);
     setTimeout(() => response.end(), 1500).unref();
   });
-  studio.store.saveSettings({ ...studio.store.settings(), textUrl: `${url}/v1`, textModel: 'test' });
+  studio.store.saveSettings({ ...studio.store.settings(), textUrl: `${url}/v1`, textModel: 'test', contextWindow:32768 });
   const chat = (await studio.call('/chats', 'POST', { characterId: studio.store.list<Character>('characters')[0].id })).json<Chat>();
-  await studio.call(`/chats/${chat.id}/generations`, 'POST', { content: '继续', expectedChatRevision: 1 });
+  const generated=await studio.call(`/chats/${chat.id}/generations`, 'POST', { content: '继续', expectedChatRevision: 1 });
+  assert.equal(generated.statusCode,202,generated.body);
   await until(() => !!studio.store.messages(chat.id).at(-1)?.content);
   await studio.call(`/chats/${chat.id}/cancel`, 'POST', {});
   await until(() => !studio.provider.running.has(chat.id));
@@ -245,7 +247,9 @@ test('prompt budgeting preserves the current user message and rejects oversized 
   const character = studio.store.list<Character>('characters')[0];
   const messages = Array.from({ length: 40 }, (_, index) => ({ id: String(index), chatId: 'test', role: 'user', content: `历史${'长'.repeat(80)}`, status: 'complete', createdAt: '' } as Message));
   messages.push({ ...messages[0], content: '必须保留的最新问题' });
-  const settings = { ...studio.store.settings(), contextWindow: 2048, maxTokens: 512 };
+  const baseSettings={...studio.store.settings(),contextWindow:100000,maxTokens:512};
+  const fixedBytes=assemblePrompt(character,[],baseSettings).reduce((n,m)=>n+Buffer.byteLength(m.content,'utf8')+64,0);
+  const settings = { ...baseSettings, contextWindow: fixedBytes+2048 }; 
   const result = assemblePrompt(character, messages, settings);
   assert.equal(result.at(-1)!.content, '必须保留的最新问题');
   assert.ok(result.length < messages.length);

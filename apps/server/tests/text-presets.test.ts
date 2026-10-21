@@ -17,9 +17,10 @@ test('chat presets are budgeted, isolated from drafts and persist per model acro
   assert.equal(created.statusCode, 200);
   const saved = created.json<Settings>();
   const character = studio.store.list<Character>('characters')[0];
-  const prompt = assemblePrompt(character, [], saved);
-  assert.equal(prompt[1].content, `${character.name} 与 旅人 自然交谈。`);
-  assert.throws(() => assemblePrompt(character, [], { ...saved, contextWindow: 2048, maxTokens: 512, textSystemPrompt: '长'.repeat(1000) }), /预算/);
+  const chat=(await studio.call('/chats','POST',{characterId:character.id})).json<Chat>();
+  const prompt = studio.provider.prompt(chat.id,character, [], saved);
+  assert.equal(prompt[0].content, `${character.name} 与 旅人 自然交谈。`);
+  assert.throws(() => studio.provider.prompt(chat.id,character, [], { ...saved, contextWindow: 2048, maxTokens: 512, textSystemPrompt: '长'.repeat(1000) }), /预算/);
   await studio.provider.imagePrompt(undefined, [], '杯子');
   assert.ok(!JSON.stringify(draftBody.messages).includes('自然交谈'));
   await studio.call(`/text-models/${initial.activeTextProfileId}/activate`, 'POST', {});
